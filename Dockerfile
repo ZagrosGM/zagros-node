@@ -71,7 +71,7 @@ RUN python3 -m venv /opt/venv \
 # Final image
 # --------------------------------------------------------------------------
 FROM python:$PYTHON_VERSION-slim
-ARG ZAGROS_NODE_VERSION=0.1.0
+ARG ZAGROS_NODE_VERSION=0.3.3
 LABEL org.opencontainers.image.title="Zagros Node" \
       org.opencontainers.image.description="Zagros Node — multi-core remote node agent (xray, sing-box, OpenVPN, WireGuard, SSH, SoftEther, PPTP)" \
       org.opencontainers.image.source="https://github.com/ZagrosGM/zagros-node" \

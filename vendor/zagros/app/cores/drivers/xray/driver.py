@@ -109,6 +109,9 @@ class XrayDriver(BaseCoreDriver):
             "executable_path": "/var/lib/zagros/cores/xray/bin/xray",
             "assets_path": "/var/lib/zagros/cores/xray/assets",
             "config_path": "/var/lib/zagros/cores/xray/xray_config.json",
+            # Explicit so a standalone node's root relocation also relocates
+            # materialized TLS pairs instead of falling back to a panel path.
+            "cert_dir": "/var/lib/zagros/cores/xray/certs",
         },
         homepage="https://github.com/XTLS/Xray-core",
         release_repo="XTLS/Xray-core",

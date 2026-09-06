@@ -41,6 +41,8 @@ _SUSPENDED_EXPIRES = "2000/01/01 00:00:00"
 @runtime_checkable
 class SoftEtherBackend(Protocol):
     def reachable(self) -> bool: ...
+    def server_reachable(self) -> bool: ...
+    def ensure_primary_hub(self) -> bool: ...
     def version(self) -> str | None: ...
     def user_create(self, username: str, note: str = "") -> None: ...
     def user_delete(self, username: str) -> None: ...
@@ -101,6 +103,11 @@ class LocalSoftEtherBackend:
         self.password = settings.get("admin_password", "")
         self.timeout = float(settings.get("vpncmd_timeout", 30.0))
         self.protocol_backoff = float(settings.get("protocol_backoff_seconds", 10.0))
+        # Bare vpncmd targets port 443, which is normally occupied by the
+        # panel's HTTPS proxy. A fresh standalone SoftEther server also opens
+        # TCP 5555/992/1194; cache the first working local management listener
+        # so every later command stays on the same endpoint.
+        self._active_server: str | None = None
         # The panel container is recreated on every image upgrade. SoftEther's
         # daemon configuration lives beside vpnserver, so /usr/local was both
         # a binary-loss and a configuration-loss boundary. New installs use
@@ -222,6 +229,41 @@ class LocalSoftEtherBackend:
             table.append(line)
         return "\n".join(table) + ("\n" if table else "")
 
+    def _server_candidates(self) -> tuple[str, ...]:
+        """Return bounded vpncmd endpoints for one configured server.
+
+        Only bare loopback targets get listener fallback. An explicitly
+        configured port or a remote hostname is authoritative and is never
+        silently redirected.
+        """
+        configured = str(self.server or "localhost").strip() or "localhost"
+        if configured in {"localhost", "127.0.0.1"}:
+            ordered = (
+                f"{configured}:5555",
+                f"{configured}:992",
+                f"{configured}:1194",
+                configured,  # vpncmd's normal TCP/443 behavior
+            )
+        else:
+            ordered = (configured,)
+        if self._active_server in ordered:
+            return (self._active_server,) + tuple(
+                candidate for candidate in ordered
+                if candidate != self._active_server
+            )
+        return ordered
+
+    @staticmethod
+    def _is_endpoint_failure(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(marker in message for marker in (
+            "during client login",
+            "before client prompt after authentication",
+            "timed out during client login",
+            "timed out waiting for client prompt",
+            "interactive client exited",
+        ))
+
     def _cmd(self, command: str, *, csv: bool = False,
              hub: bool = True, hub_name: str | None = None) -> str:
         """Run a hub-scoped or entire-server vpncmd command.
@@ -241,7 +283,6 @@ class LocalSoftEtherBackend:
                 "runtime on Start; use Install only if automatic recovery "
                 "reports that no package/cache source is available."
             )
-        argv = [executable, self.server, "/SERVER"]
         selected_hub: str | None = None
         switch_hub_after_server_auth = False
         if hub:
@@ -249,7 +290,7 @@ class LocalSoftEtherBackend:
             if hub_name is None:
                 # Existing primary-hub behavior: authenticate directly to the
                 # configured hub (backward compatible with deployed servers).
-                argv.append(f"/HUB:{selected_hub}")
+                pass
             else:
                 # A newly created isolated hub has its own random admin secret.
                 # Do not persist that secret and do not pretend the server-admin
@@ -257,8 +298,6 @@ class LocalSoftEtherBackend:
                 # then select the hub with vpncmd's `Hub` command; server admin
                 # authority can manage every hub safely this way.
                 switch_hub_after_server_auth = True
-        if csv:
-            argv.append("/CSV")
         # Never place authentication material OR a secret-bearing command in
         # argv. Stable vpncmd can discard queued commands after a password read
         # from a plain PIPE; use the bounded no-echo PTY channel shared with the
@@ -272,17 +311,38 @@ class LocalSoftEtherBackend:
         commands = ([f"Hub {selected_hub}"]
                     if switch_hub_after_server_auth else [])
         commands.append(command)
-        try:
-            result = run_vpncmd_pty(
-                argv,
-                commands=commands,
-                administrator_password=self.password,
-                prompt="VPN Server",
-                timeout=self.timeout,
-            )
-        except CoreError as exc:
+        last_error: CoreError | None = None
+        candidates = self._server_candidates()
+        for index, candidate in enumerate(candidates):
+            argv = [executable, candidate, "/SERVER"]
+            if hub and hub_name is None:
+                argv.append(f"/HUB:{selected_hub}")
+            if csv:
+                argv.append("/CSV")
+            try:
+                result = run_vpncmd_pty(
+                    argv,
+                    commands=commands,
+                    administrator_password=self.password,
+                    prompt="VPN Server",
+                    timeout=self.timeout,
+                )
+            except CoreError as exc:
+                last_error = exc
+                if index + 1 < len(candidates) and self._is_endpoint_failure(exc):
+                    if candidate == self._active_server:
+                        self._active_server = None
+                    continue
+                raise CoreError(
+                    f"vpncmd '{safe}' failed: {self._safe_command(str(exc))}"
+                ) from exc
+            self._active_server = candidate
+            break
+        else:  # pragma: no cover - every failed attempt raises above
+            assert last_error is not None
             raise CoreError(
-                f"vpncmd '{safe}' failed: {self._safe_command(str(exc))}") from exc
+                f"vpncmd '{safe}' failed: {self._safe_command(str(last_error))}"
+            ) from last_error
         if csv:
             # UserList must reflect live identity before an idempotent account
             # reconcile; a banner-as-header made it empty and caused duplicate
@@ -380,7 +440,10 @@ class LocalSoftEtherBackend:
         except CoreError as exc:
             text = str(exc).lower()
             if any(marker in text for marker in (
-                "not found", "not exist", "does not exist", "error code 54",
+                # Stable 4.44 returns 53 for an absent listener; some newer
+                # command tables use 54 for the same idempotent condition.
+                "not found", "not exist", "does not exist", "error code 53",
+                "error code 54",
             )):
                 return False
             raise
@@ -578,6 +641,28 @@ class LocalSoftEtherBackend:
                 "provide a real external DHCP/local bridge."
             )
 
+    def server_reachable(self) -> bool:
+        """Whether server-admin authority works, independent of hub existence.
+
+        ``reachable()`` is intentionally hub-scoped for normal account work.
+        A fresh standalone-node daemon may be alive before its configured
+        ``DEFAULT`` hub exists, so using only that probe creates a circular
+        failure: Start waits for a hub that only Start can create.
+        """
+        try:
+            self._cmd("ServerInfoGet", hub=False)
+            return True
+        except CoreError:
+            return False
+
+    def ensure_primary_hub(self) -> bool:
+        """Create the configured primary hub when an authorised server is blank."""
+        selected = self._validate_hub_name(self.hub)
+        hubs = self.hub_list()
+        if selected not in hubs:
+            self.hub_create(selected, self.password)
+        return self.reachable()
+
     def recover_fresh_server_password(self) -> bool:
         """Apply the persisted admin password to a demonstrably blank server.
 
@@ -605,7 +690,10 @@ class LocalSoftEtherBackend:
             return False
         finally:
             self.password = desired
-        return self.reachable()
+        # The configured hub may not exist yet on a genuinely blank server.
+        # Password recovery proves server authority only; the driver creates
+        # the primary hub immediately afterwards.
+        return self.server_reachable()
 
     # ------------------------------------------------------------------ #
     # setup — real SELF_INSTALL (3-stage chain)
@@ -1323,6 +1411,33 @@ class LocalSoftEtherBackend:
             if candidate and self._usable_executable(candidate):
                 return candidate
         return None
+
+    def server_running(self) -> bool:
+        """Cheaply detect this exact vpnserver binary without opening TCP.
+
+        This avoids three authenticated vpncmd probes against unrelated local
+        services before a fresh daemon has even been launched. ``/proc`` is
+        authoritative for direct-host and container/node deployments; failure
+        to inspect a process simply leaves it out of the result.
+        """
+        binary = self.server_binary()
+        if binary is None:
+            return False
+        expected = os.path.realpath(binary)
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return False
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                actual = os.path.realpath(os.readlink(f"/proc/{entry}/exe"))
+            except OSError:
+                continue
+            if actual == expected:
+                return True
+        return False
 
     def server_start(self) -> None:
         """Launch the SoftEther daemon (it self-forks); idempotent by design —

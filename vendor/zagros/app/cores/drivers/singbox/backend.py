@@ -255,10 +255,17 @@ class LocalSingBoxBackend:
                 )
                 source = "vendor"
             else:
+                if self.settings.get("stats_enabled"):
+                    raise CoreError(
+                        "no published Zagros stats-enabled sing-box build exists "
+                        f"for {system}/{arch} v{version}; refusing to install the "
+                        "official build because it lacks with_v2ray_api and would "
+                        "silently disable per-user accounting. Publish/select a "
+                        "vendor-singbox build, or explicitly disable stats_enabled."
+                    )
                 logger.info(
                     "no vendored stats-enabled sing-box build for %s/%s v%s — "
-                    "falling back to the official build (per-user accounting "
-                    "will probe-degrade if the API is absent)",
+                    "stats are explicitly disabled, using the official build",
                     system, arch, version,
                 )
                 tag = install_from_github(

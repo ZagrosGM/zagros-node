@@ -475,6 +475,15 @@ class CoreManager:
                     f"Cannot start core '{core_id}' from state '{state.value}'."
                 )
             await self._transition(core_id, driver, CoreState.STARTING, CoreState.RUNNING, driver.start)
+            # Start-time recovery may intentionally repair persistent settings
+            # (for example provisioning SoftEther authority or resolving a
+            # self-installed binary). Persist the resulting validated driver
+            # state instead of keeping the pre-start snapshot forever.
+            await self._store.save_state(
+                core_id, state=self._states[core_id],
+                enabled=self._enabled.get(core_id, False),
+                settings=driver.settings,
+            )
             return await driver.status()
 
     async def stop_core(self, core_id: str) -> CoreStatus:
@@ -503,6 +512,11 @@ class CoreManager:
                 await self._set_state(core_id, CoreState.ERROR)
                 raise
             await self._set_state(core_id, CoreState.RUNNING)
+            await self._store.save_state(
+                core_id, state=self._states[core_id],
+                enabled=self._enabled.get(core_id, False),
+                settings=driver.settings,
+            )
             return await driver.status()
 
     async def start_enabled(self) -> None:

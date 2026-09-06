@@ -113,13 +113,33 @@ def run_vpncmd_pty(
         while (password_re.search(bytes(data)) is None
                and prompt_re.search(bytes(data)) is None):
             if process.poll() is not None:
+                if b"Connection has been established with VPN Server" in data:
+                    # The TCP endpoint is correct; vpncmd rejected the selected
+                    # hub/admin context before presenting a prompt. Surface a
+                    # semantic login failure so callers do not fall through to
+                    # unrelated localhost ports (often the panel on TCP/443).
+                    raise CoreError("vpncmd server or hub login rejected")
                 raise CoreError("vpncmd exited during client login")
             if time.monotonic() >= deadline:
                 raise CoreError("vpncmd timed out during client login")
             read_more()
         if password_re.search(bytes(data)) is not None:
+            auth_start = len(data)
             os.write(master, (administrator_password + "\n").encode())
-            wait_for(prompt_re, login_start, "client prompt after authentication")
+            denied_re = re.compile(rb"Access has been denied", re.IGNORECASE)
+            deadline = time.monotonic() + timeout
+            while prompt_re.search(bytes(data[auth_start:])) is None:
+                if denied_re.search(bytes(data[auth_start:])) is not None:
+                    raise CoreError("vpncmd authentication rejected")
+                if process.poll() is not None:
+                    raise CoreError(
+                        "vpncmd exited before client prompt after authentication"
+                    )
+                if time.monotonic() >= deadline:
+                    raise CoreError(
+                        "vpncmd timed out waiting for client prompt after authentication"
+                    )
+                read_more()
 
         def execute(command: str) -> None:
             validate_command(command)

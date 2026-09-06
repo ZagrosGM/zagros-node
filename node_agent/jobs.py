@@ -73,9 +73,18 @@ class JobManager:
                      *, timeout: float = 900.0) -> Job:
         async with self._lock:
             if core_id in self._active:
+                active = self._jobs[self._active[core_id]]
+                # Lifecycle requests are safe to retry across a lost/slow HTTP
+                # response.  Joining the identical in-flight action prevents a
+                # double-click or panel convergence retry from turning a valid
+                # long SoftEther start into a misleading HTTP 409.  A different
+                # action still conflicts — stop while install is running is not
+                # something the agent may guess about.
+                if active.action == action:
+                    return active
                 raise JobConflictError(
-                    f"a job for core '{core_id}' is already "
-                    f"{self._jobs[self._active[core_id]].state}")
+                    f"a '{active.action}' job for core '{core_id}' is already "
+                    f"{active.state} (job {active.job_id})")
             job = Job(job_id=uuid.uuid4().hex, core_id=core_id, action=action)
             self._remember(job)
             self._active[core_id] = job.job_id

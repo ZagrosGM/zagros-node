@@ -1069,11 +1069,49 @@ class SingBoxDriver(BaseCoreDriver):
     # ------------------------------------------------------------------ #
     # lifecycle
     # ------------------------------------------------------------------ #
+    async def _repair_node_stats_binary(self) -> None:
+        """Replace an old official node binary with Zagros' stats-enabled one.
+
+        Before the vendor releases were published, standalone nodes fell back
+        to upstream's official binary.  That binary runs traffic correctly but
+        is compiled without ``with_v2ray_api``, so unified per-user accounting
+        turns yellow.  Existing installs keep their binary across image
+        upgrades; repair it once on node start instead of requiring data loss
+        or a manual uninstall/reinstall.  A network/vendor outage never stops
+        an already-working core — it remains explicitly degraded and retries
+        on the next node restart.
+        """
+        if (self.settings.get("_runtime_mode") != "node"
+                or not self.settings.get("stats_enabled")
+                or self._v2ray_api_supported()):
+            return
+        installer = getattr(self._backend, "install_binary", None)
+        if not callable(installer):
+            return
+        version = self.settings.get("release_version") or None
+        logger.warning(
+            "sing-box: repairing persisted official binary with the Zagros "
+            "stats-enabled build%s",
+            f" v{version}" if version else "",
+        )
+        try:
+            await asyncio.to_thread(installer, version)
+            self._persist_backend_executable()
+            self._v2ray_supported = None
+            if not self._v2ray_api_supported():
+                raise CoreError(
+                    "replacement sing-box binary still lacks with_v2ray_api")
+        except Exception as exc:  # noqa: BLE001 — preserve existing traffic
+            self._v2ray_supported = False
+            logger.warning(
+                "sing-box stats-enabled binary repair deferred: %s", exc)
+
     async def start(self) -> None:
         # fresh config goes live now — any earlier stats-listener error is
         # stale by definition (the listener field was dying on a pre-start
         # socket); the next probe-driven tick settles the verdict freshly.
         self._stats_error = None
+        await self._repair_node_stats_binary()
         rendered = self.render_config()
         await asyncio.to_thread(self._backend.apply_config, rendered)
         await asyncio.to_thread(self._backend.start)

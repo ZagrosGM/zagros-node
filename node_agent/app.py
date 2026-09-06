@@ -20,10 +20,12 @@ compat.install()
 
 import asyncio
 import base64
+import copy
 import inspect
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -164,14 +166,20 @@ def _authorize_core(core_id: str, settings: dict[str, Any] | None = None) -> Non
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await core_manager.boot()
-    await core_manager.start_enabled()
-    restore_usage_baselines()
-    await restore_accounts()
-    limiter.load()
-    limiter.apply()   # limits pushed earlier must survive a restart
+    # The public bootstrap endpoint must not be held hostage by core recovery.
+    # A persisted SoftEther/OpenVPN/etc. start can legitimately take minutes;
+    # the installer and panel discovery only need identity + certificate data,
+    # so bind the info port first and keep it serving while enabled cores and
+    # account/limit state are restored.  The signed control plane still does
+    # not report application startup complete until reconciliation finishes.
     stop_info = await start_info_server(CFG, identity, core_manager, CERTIFICATE,
                                         started_at=STARTED_AT)
     try:
+        await core_manager.start_enabled()
+        restore_usage_baselines()
+        await restore_accounts()
+        limiter.load()
+        limiter.apply()   # limits pushed earlier must survive a restart
         yield
     finally:
         await stop_info()
@@ -199,6 +207,10 @@ class CoreActionBody(BaseModel):
 
 class InboundDocument(BaseModel):
     document: dict[str, Any]
+    # Node-local file material referenced by ``zagros-material://<name>`` in
+    # the document.  Currently restricted to validated Xray TLS PEM pairs;
+    # this is deliberately not a generic remote file-write API.
+    material: dict[str, str] = Field(default_factory=dict)
 
 
 class SettingsPatch(BaseModel):
@@ -326,6 +338,10 @@ async def cores(_node=Depends(signed_request)):
     installed = set(core_manager.list_cores())
     return {
         "installed": by_id,
+        # Explicit protocol capabilities let a patched panel roll out before
+        # patched nodes without sending reserved material references to an old
+        # agent that would persist them as ordinary (and unusable) paths.
+        "features": {"xray_tls_material": 1},
         # catalog = every allowlisted core this image can install, minus the
         # ones already installed (exactly the panel's Master semantics).
         "available": sorted(NODE_CORE_ALLOWLIST.intersection(
@@ -778,6 +794,104 @@ async def core_lifecycle(core_id: str, body: CoreActionBody, wait: float = 0,
     return payload
 
 
+_NODE_MATERIAL_PREFIX = "zagros-material://"
+_NODE_MATERIAL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
+_NODE_TLS_FILE_LIMIT = 32
+_NODE_TLS_ITEM_BYTES = 128 * 1024
+_NODE_TLS_TOTAL_BYTES = 2 * 1024 * 1024
+
+
+def _materialize_xray_tls(document: dict[str, Any],
+                          material: dict[str, str]) -> dict[str, Any]:
+    """Resolve transported Xray PEM pairs into this node's confined data root.
+
+    The panel may supply file *contents*, never a destination.  References are
+    recognised only inside native Xray TLS certificate entries; names are
+    basename-only, every pair is cryptographically validated, and unused
+    uploads are rejected.  This keeps node sync from becoming a generic
+    signed arbitrary-file-write primitive.
+    """
+    if len(material) > _NODE_TLS_FILE_LIMIT:
+        raise ValueError("too many Xray TLS material files")
+    total = 0
+    for name, value in material.items():
+        if not _NODE_MATERIAL_NAME.fullmatch(name):
+            raise ValueError(f"invalid Xray TLS material name: {name!r}")
+        if not isinstance(value, str):
+            raise ValueError(f"Xray TLS material '{name}' must be PEM text")
+        size = len(value.encode("utf-8"))
+        if size > _NODE_TLS_ITEM_BYTES:
+            raise ValueError(f"Xray TLS material '{name}' is too large")
+        total += size
+    if total > _NODE_TLS_TOTAL_BYTES:
+        raise ValueError("Xray TLS material exceeds 2 MiB")
+
+    driver = core_manager.get("xray")
+    cert_dir = Path(str(driver.settings.get("cert_dir")
+                        or f"{CORE_ROOT}/cores/xray/certs")).resolve()
+    root = Path(CORE_ROOT).resolve()
+    if cert_dir != root and root not in cert_dir.parents:
+        raise ValueError("the Xray certificate directory escapes the node core root")
+    cert_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    prepared = copy.deepcopy(document)
+    consumed: set[str] = set()
+    for inbound in prepared.get("inbounds") or []:
+        if not isinstance(inbound, dict):
+            continue
+        tls = ((inbound.get("streamSettings") or {}).get("tlsSettings") or {})
+        certificates = tls.get("certificates") or []
+        if not isinstance(certificates, list):
+            continue
+        for pair in certificates:
+            if not isinstance(pair, dict):
+                continue
+            cert_ref = str(pair.get("certificateFile") or "")
+            key_ref = str(pair.get("keyFile") or "")
+            cert_remote = cert_ref.startswith(_NODE_MATERIAL_PREFIX)
+            key_remote = key_ref.startswith(_NODE_MATERIAL_PREFIX)
+            if not cert_remote and not key_remote:
+                continue
+            if not cert_remote or not key_remote:
+                raise ValueError("Xray TLS material references must be a complete pair")
+            cert_name = cert_ref[len(_NODE_MATERIAL_PREFIX):]
+            key_name = key_ref[len(_NODE_MATERIAL_PREFIX):]
+            if (not _NODE_MATERIAL_NAME.fullmatch(cert_name)
+                    or not _NODE_MATERIAL_NAME.fullmatch(key_name)
+                    or not cert_name.endswith(".crt")
+                    or not key_name.endswith(".key")
+                    or cert_name[:-4] != key_name[:-4]):
+                raise ValueError("invalid paired Xray TLS material references")
+            try:
+                cert_pem, key_pem = material[cert_name], material[key_name]
+            except KeyError as exc:
+                raise ValueError(f"missing Xray TLS material '{exc.args[0]}'") from exc
+            from app.studio.certs import CertificateError, validate_pem_pair
+
+            try:
+                validate_pem_pair(
+                    cert_pem, key_pem,
+                    context=f"Xray TLS inbound '{inbound.get('tag') or '?'}'")
+            except CertificateError as exc:
+                raise ValueError(str(exc)) from exc
+            cert_path, key_path = cert_dir / cert_name, cert_dir / key_name
+            for path, text, mode in (
+                (cert_path, cert_pem, 0o644),
+                (key_path, key_pem, 0o600),
+            ):
+                part = path.with_name(path.name + ".part")
+                part.write_text(text, encoding="utf-8")
+                os.chmod(part, mode)
+                os.replace(part, path)
+            pair["certificateFile"] = str(cert_path)
+            pair["keyFile"] = str(key_path)
+            consumed.update((cert_name, key_name))
+    unused = sorted(set(material) - consumed)
+    if unused:
+        raise ValueError(f"unused Xray TLS material: {unused}")
+    return prepared
+
+
 @app.put("/v1/cores/{core_id}/inbounds")
 async def core_inbounds(core_id: str, body: InboundDocument,
                         _node=Depends(signed_request)):
@@ -785,9 +899,16 @@ async def core_inbounds(core_id: str, body: InboundDocument,
     _authorize_core(core_id)
     if core_id not in core_manager.list_cores():
         raise HTTPException(404, f"core '{core_id}' is not installed")
+    if body.material and core_id != "xray":
+        raise HTTPException(422, "file material is supported only for Xray TLS sync")
+    try:
+        document = (_materialize_xray_tls(body.document, body.material)
+                    if core_id == "xray" else body.document)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     try:
         await asyncio.wait_for(
-            core_manager.apply_studio_document(core_id, body.document), timeout=120)
+            core_manager.apply_studio_document(core_id, document), timeout=120)
     except asyncio.TimeoutError as exc:
         raise HTTPException(504, "inbound apply timed out") from exc
     except Exception as exc:

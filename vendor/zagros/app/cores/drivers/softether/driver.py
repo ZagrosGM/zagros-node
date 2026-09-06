@@ -321,8 +321,16 @@ class SoftEtherDriver(BaseCoreDriver):
     )
 
     def __init__(self, settings: dict[str, Any] | None = None, *, backend: Any | None = None):
-        raw_sstp_port = int((settings or {}).get("sstp_port") or 443)
-        super().__init__(settings)
+        prepared = dict(settings or {})
+        # A blank server/hub password works only on a pristine local daemon and
+        # cannot be restored safely after a node/container restart. Provision
+        # one authority secret before constructing the backend; CoreManager
+        # persists driver-mutated settings after install/start, encrypted by the
+        # node state store (and by the panel store on Master).
+        if not str(prepared.get("admin_password") or "").strip():
+            prepared["admin_password"] = secrets.token_urlsafe(24)
+        raw_sstp_port = int(prepared.get("sstp_port") or 443)
+        super().__init__(prepared)
         # Heal pre-8.8 rows that persisted a custom generic TLS listener as an
         # SSTP endpoint. Retain the old value only so the next Studio apply can
         # remove that stale listener without touching unrelated ports.
@@ -1062,10 +1070,63 @@ class SoftEtherDriver(BaseCoreDriver):
                 await asyncio.to_thread(self.disable_policy_source, source_id)
                 await asyncio.to_thread(self.ensure_policy_source, source_id)
 
-        if await asyncio.to_thread(self._backend.reachable):
+        async def finish_if_authorized() -> bool:
+            """Close the fresh-node gap: live server, but no primary hub yet."""
+            server_reachable = getattr(self._backend, "server_reachable", None)
+            if not callable(server_reachable):
+                return False
+            if not await asyncio.to_thread(server_reachable):
+                return False
+            ensure_hub = getattr(self._backend, "ensure_primary_hub", None)
+            if callable(ensure_hub):
+                await asyncio.to_thread(ensure_hub)
+            if not await asyncio.to_thread(self._backend.reachable):
+                return False
             await self._converge_clone_servers()
             await restore_policy_source()
+            return True
+
+        async def recover_blank_authority() -> bool:
+            recover = getattr(
+                self._backend, "recover_fresh_server_password", None)
+            if not callable(recover):
+                return False
+            if not await asyncio.to_thread(recover):
+                return False
+            logger.warning(
+                "softether recovered persisted admin authority on a fresh "
+                "server; ensuring the primary hub before reconciliation"
+            )
+            return await finish_if_authorized()
+
+        async def reconcile_existing_server() -> bool:
+            if await asyncio.to_thread(self._backend.reachable):
+                # Factory authority is blank, so vpncmd presents a privileged
+                # prompt without checking whatever password we supplied.
+                # Replace that blank state before accepting hub reachability as
+                # proof that the persisted administrator secret is actually live.
+                if await recover_blank_authority():
+                    return True
+                await self._converge_clone_servers()
+                await restore_policy_source()
+                return True
+            # A daemon can be healthy at server scope while its DEFAULT hub is
+            # absent. Try the scoped blank-authority bootstrap first, then
+            # normal persisted server authority, and create the hub immediately.
+            return (await recover_blank_authority()
+                    or await finish_if_authorized())
+
+        running_probe = getattr(self._backend, "server_running", None)
+        known_running: bool | None = None
+        if callable(running_probe):
+            known_running = await asyncio.to_thread(running_probe)
+        # When this exact local binary is known to be stopped, do not spend up
+        # to three vpncmd login timeouts talking to unrelated services on its
+        # future listener ports. Launch it first. Injected/external backends
+        # without a process probe retain the original reachability behavior.
+        if known_running is not False and await reconcile_existing_server():
             return
+
         server_binary = getattr(self._backend, "server_binary", lambda: None)
         # Package/container filesystems are replaced during panel upgrades.
         # Recover the daemon automatically into the persistent install root;
@@ -1083,33 +1144,35 @@ class SoftEtherDriver(BaseCoreDriver):
             detail = await asyncio.to_thread(repair)
             logger.info("softether automatic runtime recovery: %s", detail)
         server_start = getattr(self._backend, "server_start", None)
+        start_error: Exception | None = None
         if callable(server_start) and server_binary() is not None:
-            await asyncio.to_thread(server_start)
+            try:
+                await asyncio.to_thread(server_start)
+            except Exception as exc:  # daemon may already be starting/blank
+                start_error = exc
             # Real persistent servers can spend well over ten seconds loading
             # vpn_server.config, SecureNAT and packet/security logs after a
-            # container/host restart. Probe slowly: rapid localhost vpncmd TLS
-            # connections trigger SoftEther's own DoS guard and prevent the
-            # daemon from ever becoming ready. Bound the quiet wait at 60s.
+            # container/host restart. Probe quietly: rapid localhost vpncmd TLS
+            # connections trigger SoftEther's own DoS guard. Server authority
+            # is tested separately from hub presence, and blank authority is
+            # retried sparsely while the daemon comes online.
             await asyncio.sleep(3.0)
-            for _ in range(30):
+            for attempt in range(30):
                 if await asyncio.to_thread(self._backend.reachable):
+                    if await recover_blank_authority():
+                        return
                     await self._converge_clone_servers()
                     await restore_policy_source()
                     return
+                if attempt in (0, 5, 15) and await recover_blank_authority():
+                    return
+                if await finish_if_authorized():
+                    return
                 await asyncio.sleep(2.0)
-            recover_password = getattr(
-                self._backend, "recover_fresh_server_password", None)
-            if callable(recover_password) and await asyncio.to_thread(recover_password):
-                logger.warning(
-                    "softether recovered persisted admin authority on a fresh "
-                    "post-upgrade server; Studio/accounts will now reconcile"
-                )
-                await self._converge_clone_servers()
-                await restore_policy_source()
-                return
+        detail = f"; daemon start reported: {start_error}" if start_error else ""
         raise CoreError(
             f"SoftEther hub '{self.settings['hub']}' unreachable via vpncmd "
-            f"at {self.settings['server']} after automatic runtime recovery — "
+            f"at {self.settings['server']} after automatic runtime recovery{detail} — "
             f"check the persisted admin password/hub and core logs."
         )
 
@@ -1146,24 +1209,16 @@ class SoftEtherDriver(BaseCoreDriver):
         yield  # pragma: no cover - keeps this an async generator
 
     async def install(self) -> None:
-        """Real install: apt when shipped by the distro, else the official
-        GitHub release (vpnserver + vpncmd + hamcore.se2), then a first
-        daemon start so the hub answers right away."""
+        """Install and prove a manageable server + primary hub.
+
+        A binary on disk is not a successful node install.  Fresh stable
+        bundles can start with blank server authority and no ``DEFAULT`` hub;
+        run the same bounded bootstrap used by Start so Install cannot return
+        green and leave the immediately-following convergence doomed.
+        """
         detail = await asyncio.to_thread(self._backend.install_packages)
         logger.info("softether %s", detail)
-        if not await asyncio.to_thread(self._backend.reachable):
-            try:
-                await asyncio.to_thread(self._backend.server_start)
-            except Exception as exc:  # noqa: BLE001 — install still valid
-                logger.warning("softether installed but first start failed: %s", exc)
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            if await asyncio.to_thread(self._backend.reachable):
-                # a fresh vpn_server.config has the OpenVPN (UDP/1194) and
-                # SSTP (TCP/443) clones ON — release them now, not on the
-                # next start, so the real OpenVPN core can bind immediately
-                await self._converge_clone_servers()
-                break
+        await self.start()
 
     # ------------------------------------------------------------------ #
     # user management
