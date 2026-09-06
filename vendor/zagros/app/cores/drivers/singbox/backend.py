@@ -378,7 +378,33 @@ class LocalSingBoxBackend:
         logger.warning("sing-box started (pid=%s)", self._proc.pid)
 
     @staticmethod
-    def _expected_listeners(config: dict[str, Any]) -> set[tuple[str, int]]:
+    def _tcp_endpoint(value: Any) -> tuple[str, int] | None:
+        """Parse sing-box's ``host:port`` control-listener spelling.
+
+        Both experimental APIs are TCP services.  Retaining the host lets a
+        future readiness probe distinguish loopback from public listeners;
+        ``_expected_listeners`` currently needs only the bound port because
+        ``ss`` reports wildcard/IPv4/IPv6 addresses in different forms.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.startswith("[") and "]:" in text:
+            host, raw_port = text[1:].rsplit("]:", 1)
+        else:
+            host, separator, raw_port = text.rpartition(":")
+            if not separator:
+                return None
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= port <= 65535:
+            return None
+        return (host or "127.0.0.1", port)
+
+    @classmethod
+    def _expected_listeners(cls, config: dict[str, Any]) -> set[tuple[str, int]]:
         expected: set[tuple[str, int]] = set()
         for inbound in config.get("inbounds") or []:
             port = int(inbound.get("listen_port") or 0)
@@ -391,6 +417,20 @@ class LocalSingBoxBackend:
                 expected |= {("tcp", port), ("udp", port)}
             else:
                 expected.add(("tcp", port))
+
+        # Internal listeners are part of the rendered runtime contract too.
+        # Omitting them let a process reach RUNNING while the accounting API
+        # on 19091 had never bound; the next recorder tick then produced the
+        # misleading yellow "probe passed / connection refused" warning.
+        experimental = config.get("experimental") or {}
+        for section, field in (
+            ("v2ray_api", "listen"),
+            ("clash_api", "external_controller"),
+        ):
+            body = experimental.get(section) or {}
+            endpoint = cls._tcp_endpoint(body.get(field))
+            if endpoint is not None:
+                expected.add(("tcp", endpoint[1]))
         return expected
 
     def wait_listeners(self, config: dict[str, Any], timeout: float = 10.0) -> None:

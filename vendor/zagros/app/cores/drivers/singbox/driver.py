@@ -77,10 +77,12 @@ _PROTOCOLS = set(_INBOUND_KEYS)
 #: protocols whose users authenticate with username+password (sing-box
 #: ``users: [{username, password}]``) — the account_id is the username
 _USERPASS_PROTOCOLS = frozenset({"naive", "socks", "http", "mixed"})
-#: values older 1.0.3 dashboards submitted for HIDDEN camouflage fields under
+#: Values older 1.0.3 dashboards submitted for HIDDEN camouflage fields under
 #: header_type=none — "never set", not a contradiction (GET was the schema
-#: default before the verb became opt-in).
-_LEGACY_TCP_HTTP_DEFAULTS = {"http_method": "GET"}
+#: default before the verb became opt-in).  Keep this driver-owned: native
+#: node agents vendor ``app.cores`` only and must never import the panel-only
+#: Studio wizard package while rendering a core configuration.
+_LEGACY_TCP_HTTP_DEFAULTS = {"http_method": "GET", "request_headers": None}
 #: the derived (no studio document) render only knows how to bind THESE —
 #: the newer per-user protocols exist only as wizard-created listeners
 _DERIVED_PROTOCOLS = frozenset({"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic"})
@@ -327,15 +329,37 @@ class SingBoxDriver(BaseCoreDriver):
             await self._wait_listeners(rendered)
 
     async def _wait_listeners(self, rendered: dict[str, Any]) -> None:
-        verify = getattr(self._backend, "wait_listeners", None)
-        if callable(verify):
-            try:
+        """Gate RUNNING on public listeners and configured control planes.
+
+        A TCP bind proves the configured address exists; a real StatsService
+        query additionally proves that the probe-positive binary registered
+        the API dialect the accounting recorder will use.  Any failure stops
+        the partially started process, so status cannot settle on RUNNING with
+        a yellow connection-refused warning a few seconds later.
+        """
+        try:
+            verify = getattr(self._backend, "wait_listeners", None)
+            verified_runtime = callable(verify)
+            if verified_runtime:
                 await asyncio.to_thread(verify, rendered)
-            except Exception:
-                # A failed readiness gate must not leave a partially-bound
-                # process pretending to be healthy.
-                await asyncio.to_thread(self._backend.stop)
-                raise
+            experimental = rendered.get("experimental") or {}
+            # Test/extension backends predating the readiness contract have no
+            # way to prove a process was started; retain their legacy behavior.
+            # The production backend always implements wait_listeners.
+            if verified_runtime and experimental.get("v2ray_api"):
+                try:
+                    await asyncio.to_thread(self._stats.query_user_counters)
+                except Exception as exc:
+                    address = self.settings.get("stats_api", "127.0.0.1:19091")
+                    self._stats_error = (
+                        f"sing-box stats listener failed readiness on {address}: {exc}"
+                    )
+                    raise CoreError(self._stats_error) from exc
+        except Exception:
+            # A failed readiness gate must not leave a partially-bound process
+            # pretending to be healthy.
+            await asyncio.to_thread(self._backend.stop)
+            raise
 
     def _merge_studio_inbounds(self) -> list[dict[str, Any]]:
         merged: list[dict[str, Any]] = []
@@ -525,7 +549,6 @@ class SingBoxDriver(BaseCoreDriver):
         (http facts without the header, unknown header kinds, REALITY) are
         refused loudly instead of being dropped."""
         from app.studio.headers import parse_http_headers
-        from app.studio.wizard import SINGBOX_TCP_HTTP_DEFAULTS
 
         header_type = str(raw.get("header_type") or "none").lower()
         if net not in ("", "tcp"):
@@ -543,8 +566,7 @@ class SingBoxDriver(BaseCoreDriver):
                 value = raw.get(key)
                 if value in (None, "", [], {}):
                     return False
-                default = (SINGBOX_TCP_HTTP_DEFAULTS.get(key)
-                           or _LEGACY_TCP_HTTP_DEFAULTS.get(key))
+                default = _LEGACY_TCP_HTTP_DEFAULTS.get(key)
                 if default in (None, ""):
                     return True
                 return str(value).strip().lower() != str(default).strip().lower()

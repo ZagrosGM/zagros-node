@@ -1,8 +1,7 @@
 source:  https://github.com/ZagrosGM/Zagros
-ref:     v1.0.4
-commit:  e1115ebc0f9f98e0d6730a8247df16f15c99c7e3
-synced:  2026-09-05T19:58:07Z
-scope:   v1.0.4 driver/xray-api updates over the v1.0.2 vendored baseline
+ref:     v1.0.4-1-gb646542
+commit:  b646542cf15bae46753fb7d88bc0c5aa97f462f0
+synced:  2026-09-06T13:42:16Z
 
 vendored paths:
   app/cores/**        — core drivers, CoreManager, registry, types

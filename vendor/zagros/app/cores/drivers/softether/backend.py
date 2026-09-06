@@ -69,6 +69,10 @@ class SoftEtherBackend(Protocol):
     def sstp_clone_set(self, *, enabled: bool) -> None:
         """`SstpEnable yes|no` — the MS-SSTP clone switch on TCP/443."""
         ...
+
+    def listener_delete(self, port: int) -> bool:
+        """Delete a generic TCP listener; False means it was already absent."""
+        ...
     def secure_nat_ensure(self, *, hub_name: str | None = None) -> None:
         """Ensure a Virtual Hub has SecureNAT + DHCP enabled."""
         ...
@@ -359,6 +363,28 @@ class LocalSoftEtherBackend:
 
     def sstp_clone_set(self, *, enabled: bool) -> None:
         self._cmd(f"SstpEnable {'yes' if enabled else 'no'}", hub=False)
+
+    def listener_delete(self, port: int) -> bool:
+        """Remove one generic TCP listener without masking real vpncmd errors.
+
+        Factory SoftEther state contains a separate Listener 443.  Turning the
+        SSTP clone switch off does not remove that socket, so the listener must
+        be deleted as a second operation.  "Already absent" is idempotent;
+        authentication/transport failures still surface.
+        """
+        clean = int(port)
+        if not 1 <= clean <= 65535:
+            raise CoreError(f"invalid SoftEther listener port: {port}")
+        try:
+            self._cmd(f"ListenerDelete {clean}", hub=False)
+        except CoreError as exc:
+            text = str(exc).lower()
+            if any(marker in text for marker in (
+                "not found", "not exist", "does not exist", "error code 54",
+            )):
+                return False
+            raise
+        return True
 
     def hub_list(self) -> list[str]:
         """Return live Virtual Hub names without changing the configured hub."""

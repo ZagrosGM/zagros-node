@@ -49,6 +49,19 @@ logger = logging.getLogger("zagros.cores.drivers.xray")
 
 FLOW_NONE = ""  # XTLSFlows.NONE.value — XTLS only supports TCP/mKCP + tls/reality
 
+# Schema defaults for wizard-only RAW/HTTP camouflage fields.  Drivers own
+# their translation defaults because native node agents vendor ``app.cores``
+# without the panel UI's complete Studio wizard module.
+_XRAY_TCP_HTTP_DEFAULTS: dict[str, Any] = {
+    "path": "/",
+    "host": None,
+    "http_method": "GET",
+    "request_headers": None,
+    "response_status": 200,
+    "response_reason": "OK",
+    "response_headers": None,
+}
+
 _PROTOCOL_SETTINGS_KEYS: dict[str, set[str]] = {
     "vmess": {"id"},
     "vless": {"id", "flow"},
@@ -482,13 +495,11 @@ class XrayDriver(BaseCoreDriver):
             # dashboards submitted them even with header_type=none — a value
             # equal to its schema default is "never set", not a request. Only
             # an EXPLICIT non-default http fact is a contradiction we name.
-            from app.studio.wizard import XRAY_TCP_HTTP_DEFAULTS
-
             def _explicit(key: str) -> bool:
                 value = raw.get(key)
                 if value in (None, "", [], {}):
                     return False
-                default = XRAY_TCP_HTTP_DEFAULTS.get(key)
+                default = _XRAY_TCP_HTTP_DEFAULTS.get(key)
                 if default in (None, ""):
                     return True
                 return str(value).strip().lower() != str(default).strip().lower()
@@ -1091,6 +1102,7 @@ class XrayDriver(BaseCoreDriver):
         inbound: dict[str, Any],
         host: dict[str, Any],
         variables: Mapping[str, Any] | None = None,
+        context: Any | None = None,
     ) -> dict[str, Any]:
         """Build the sing-box-shaped outbound fragment for one (inbound, host).
 
@@ -1103,8 +1115,16 @@ class XrayDriver(BaseCoreDriver):
             variables = defaultdict(lambda: "<missing>")
         settings = self._apply_flow_policy(settings, inbound)
         addresses = host.get("address") or []
-        server = (self._render_host_value(random.choice(addresses), variables, wild=True)
-                  if addresses else None)
+        if addresses:
+            server = self._render_host_value(
+                random.choice(addresses), variables, wild=True)
+        else:
+            # Fresh Studio inbounds need not have a legacy Host row yet.  Use
+            # the same public subscription-origin fallback as other drivers
+            # rather than exposing a wildcard listener or withholding a link.
+            from app.cores.delivery import resolve_delivery_host
+
+            server = resolve_delivery_host(None, context, inbound.get("listen")) or None
         sni_list = host.get("sni") or inbound.get("sni") or []
         sni = (self._render_host_value(random.choice(sni_list), variables, wild=True)
                if sni_list else None)
@@ -1280,7 +1300,7 @@ class XrayDriver(BaseCoreDriver):
                 remark = self._render_host_value(
                     host.get("remark") or f"{protocol} · {tag}", variables)
                 outbound = self._compose_outbound(
-                    protocol, dict(settings), tag, inbound, host, variables
+                    protocol, dict(settings), tag, inbound, host, variables, context
                 )
                 try:
                     link = share_url_for_outbound(outbound, remark)

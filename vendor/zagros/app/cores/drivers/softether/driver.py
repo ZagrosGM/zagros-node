@@ -950,6 +950,12 @@ class SoftEtherDriver(BaseCoreDriver):
             # The factory vpn_server.config ships with the clone ON: judge by
             # the live switch, not by a settings flag that was never true.
             await command("SstpEnable no")
+        if not sstp and int(s.get("native_port") or 5555) != 443:
+            # SstpEnable controls protocol dispatch only.  Factory state also
+            # has a generic Listener 443 which keeps the TCP socket occupied
+            # after the clone is disabled; remove it while retaining the safe
+            # native/management listener (5555 by default).
+            await command("ListenerDelete 443", ignore_exists=True)
         if (old_sstp_port != 443
                 and old_sstp_port != int(s.get("native_port") or 5555)):
             await command(f"ListenerDelete {old_sstp_port}", ignore_exists=True)
@@ -1021,6 +1027,13 @@ class SoftEtherDriver(BaseCoreDriver):
                         "on" if want_sstp else "off", "on" if live.sstp else "off",
                         "granted" if want_sstp else "not granted")
             await asyncio.to_thread(self._backend.sstp_clone_set, enabled=want_sstp)
+        if not want_sstp and int(s.get("native_port") or 5555) != 443:
+            delete_listener = getattr(self._backend, "listener_delete", None)
+            if callable(delete_listener):
+                # The factory listener is independent of SstpEnable and can
+                # survive an earlier partial convergence.  Reassert deletion
+                # on every start; the backend treats already-absent as success.
+                await asyncio.to_thread(delete_listener, 443)
 
     # ------------------------------------------------------------------ #
     # lifecycle — the server is external/systemd-owned; we verify reachability

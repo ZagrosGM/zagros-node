@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 AGENT_NAME = "zagros-node"
-AGENT_VERSION = "0.3.2"
+AGENT_VERSION = "0.3.3"
 API_VERSION = 1
 
 DEFAULT_PORT = 62050          # HTTPS control plane (panel → node, signed)
