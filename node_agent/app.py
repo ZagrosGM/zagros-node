@@ -28,6 +28,7 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -39,6 +40,7 @@ from app.cores.manager import CoreManager
 from app.cores.types import Capability, CoreState, UserAccount
 from app.cores.registry import available_drivers, discover_builtin, get_driver_class
 from node_agent.accounts_store import AccountsStore
+from node_agent.lease_store import LeaseStore
 from node_agent.limits import NodeBandwidthLimiter
 from node_agent import tls
 from node_agent.config import (
@@ -116,6 +118,8 @@ core_manager = CoreManager(
 # wire — see node_agent/limits.py.
 limiter = NodeBandwidthLimiter(core_manager, CFG.data_dir)
 accounts_store = AccountsStore(CFG.data_dir)
+lease_store = LeaseStore(CFG.data_dir)
+_account_locks: dict[str, asyncio.Lock] = {}
 
 _SECRET_MARKERS = ("secret", "password", "passwd", "token", "key", "psk", "pass")
 
@@ -163,6 +167,27 @@ def _authorize_core(core_id: str, settings: dict[str, Any] | None = None) -> Non
 # --------------------------------------------------------------------------- #
 # application
 # --------------------------------------------------------------------------- #
+async def _expire_connection_leases_once() -> None:
+    """Remove every currently expired temporary identity; failures retry later."""
+    for record in lease_store.expired():
+        core_id = str(record.get("core_id") or "")
+        lease_id = str(record.get("lease_id") or "")
+        if not core_id or not lease_id or core_id not in core_manager.list_cores():
+            continue
+        try:
+            async with _account_locks.setdefault(core_id, asyncio.Lock()):
+                await _remove_connection_lease(core_id, lease_id)
+        except Exception as exc:  # noqa: BLE001 — retry next short tick
+            logger.warning("expired lease teardown failed for %s: %s",
+                           core_id, type(exc).__name__)
+
+
+async def _lease_expiry_loop() -> None:
+    while True:
+        await _expire_connection_leases_once()
+        await asyncio.sleep(2)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await core_manager.boot()
@@ -180,7 +205,12 @@ async def lifespan(_app: FastAPI):
         await restore_accounts()
         limiter.load()
         limiter.apply()   # limits pushed earlier must survive a restart
-        yield
+        lease_task = asyncio.create_task(_lease_expiry_loop())
+        try:
+            yield
+        finally:
+            lease_task.cancel()
+            await asyncio.gather(lease_task, return_exceptions=True)
     finally:
         await stop_info()
         await core_manager.stop_all()
@@ -215,6 +245,12 @@ class InboundDocument(BaseModel):
 
 class SettingsPatch(BaseModel):
     settings: dict[str, Any]
+
+
+class ConnectionLeasePayload(BaseModel):
+    connection_id: str = Field(min_length=36, max_length=64)
+    not_after: datetime
+    account: dict[str, Any]
 
 
 class AccountsPayload(BaseModel):
@@ -341,7 +377,7 @@ async def cores(_node=Depends(signed_request)):
         # Explicit protocol capabilities let a patched panel roll out before
         # patched nodes without sending reserved material references to an old
         # agent that would persist them as ordinary (and unusable) paths.
-        "features": {"xray_tls_material": 1},
+        "features": {"xray_tls_material": 1, "connection_leases": 1},
         # catalog = every allowlisted core this image can install, minus the
         # ones already installed (exactly the panel's Master semantics).
         "available": sorted(NODE_CORE_ALLOWLIST.intersection(
@@ -480,6 +516,136 @@ async def core_identity(core_id: str, body: IdentityPayload,
             "restarted": restarted}
 
 
+def _active_lease_raws(core_id: str) -> list[dict[str, Any]]:
+    return [dict(record.get("account") or {})
+            for record in lease_store.active(core_id)
+            if isinstance(record.get("account"), dict)]
+
+
+def _combined_accounts(core_id: str, base_raws: list[dict[str, Any]]) -> list[UserAccount]:
+    combined: dict[str, UserAccount] = {}
+    for raw in [*base_raws, *_active_lease_raws(core_id)]:
+        account = _to_user_account(raw)
+        if account.account_id in combined:
+            raise HTTPException(409, "duplicate permanent/lease account identity")
+        combined[account.account_id] = account
+    return list(combined.values())
+
+
+def _lease_capability(driver) -> str:
+    value = str(driver.account_teardown_capability())
+    return value if value in {"targeted", "authorization_only"} else "authorization_only"
+
+
+async def _remove_connection_lease(core_id: str, lease_id: str) -> dict[str, Any]:
+    record = lease_store.get(core_id, lease_id)
+    if record is None:
+        return {"ok": True, "removed": True, "already_absent": True,
+                "observed_status": "offline"}
+    account = _to_user_account(dict(record.get("account") or {}))
+    driver = core_manager.get(core_id)
+    await asyncio.wait_for(driver.delete_account(account.account_id),
+                           timeout=_ACCOUNTS_TIMEOUT)
+    lease_store.remove(core_id, lease_id)
+    return {"ok": True, "removed": True, "already_absent": False,
+            "observed_status": "offline",
+            "teardown_capability": _lease_capability(driver)}
+
+
+@app.put("/v1/cores/{core_id}/leases/{lease_id}")
+async def apply_connection_lease(core_id: str, lease_id: str,
+                                 body: ConnectionLeasePayload,
+                                 _node=Depends(signed_request)):
+    """Apply/renew one temporary account without replacing permanent users."""
+    _authorize_core(core_id)
+    if core_id not in core_manager.list_cores():
+        raise HTTPException(404, f"core '{core_id}' is not installed")
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", lease_id):
+        raise HTTPException(422, "invalid lease id")
+    now = datetime.now(timezone.utc)
+    not_after = body.not_after if body.not_after.tzinfo else body.not_after.replace(
+        tzinfo=timezone.utc)
+    if not_after <= now or not_after > now.replace(microsecond=0) + timedelta(minutes=10):
+        raise HTTPException(422, "lease expiry is outside the accepted bound")
+    account = _to_user_account(body.account)
+    if not re.fullmatch(r"zgl-[0-9a-f]{24}", account.account_id):
+        raise HTTPException(422, "lease account id is invalid")
+    account.expire_at = not_after
+    account.enabled = True
+    lock = _account_locks.setdefault(core_id, asyncio.Lock())
+    async with lock:
+        driver = core_manager.get(core_id)
+        existing = lease_store.get(core_id, lease_id)
+        try:
+            if existing is None:
+                await asyncio.wait_for(driver.create_account(account),
+                                       timeout=_ACCOUNTS_TIMEOUT)
+            else:
+                await asyncio.wait_for(driver.update_account(account),
+                                       timeout=_ACCOUNTS_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(504, "lease apply timed out") from exc
+        except Exception as exc:  # noqa: BLE001
+            identity.audit("lease.failed", {"core_id": core_id,
+                                            "error_type": type(exc).__name__})
+            raise HTTPException(409, str(exc)) from exc
+        record = {
+            "lease_id": lease_id, "connection_id": body.connection_id,
+            "core_id": core_id, "not_after": not_after.isoformat(),
+            "account": account.model_dump(mode="json"),
+        }
+        lease_store.put(core_id, lease_id, record)
+    identity.audit("lease.apply", {"core_id": core_id})
+    # Temporary protocol material returns only to the signed, pinned panel.
+    return {"ok": True, "lease_id": lease_id, "not_after": not_after,
+            "settings": dict(account.settings),
+            "teardown_capability": _lease_capability(driver)}
+
+
+@app.delete("/v1/cores/{core_id}/leases/{lease_id}")
+async def revoke_connection_lease(core_id: str, lease_id: str,
+                                  _node=Depends(signed_request)):
+    _authorize_core(core_id)
+    if core_id not in core_manager.list_cores():
+        raise HTTPException(404, f"core '{core_id}' is not installed")
+    async with _account_locks.setdefault(core_id, asyncio.Lock()):
+        try:
+            result = await _remove_connection_lease(core_id, lease_id)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(504, "lease teardown timed out") from exc
+        except Exception as exc:  # noqa: BLE001
+            identity.audit("lease.revoke_failed", {"core_id": core_id,
+                                                    "error_type": type(exc).__name__})
+            raise HTTPException(409, str(exc)) from exc
+    identity.audit("lease.revoke", {"core_id": core_id})
+    return result
+
+
+@app.get("/v1/cores/{core_id}/leases/{lease_id}")
+async def connection_lease_status(core_id: str, lease_id: str,
+                                  _node=Depends(signed_request)):
+    _authorize_core(core_id)
+    record = lease_store.get(core_id, lease_id)
+    if record is None:
+        return {"lease_id": lease_id, "desired_status": "absent",
+                "observed_status": "offline",
+                "teardown_capability": "authorization_only"}
+    account = _to_user_account(dict(record.get("account") or {}))
+    driver = core_manager.get(core_id)
+    observed = "unknown"
+    if Capability.ONLINE_TRACKING in driver.metadata.capabilities:
+        try:
+            sessions = await asyncio.wait_for(
+                driver.get_online_devices(account_ids=[account.account_id]),
+                timeout=_TELEMETRY_TIMEOUT)
+            observed = "online" if sessions else "offline"
+        except Exception:  # noqa: BLE001
+            observed = "unknown"
+    return {"lease_id": lease_id, "desired_status": "active",
+            "observed_status": observed, "not_after": record.get("not_after"),
+            "teardown_capability": _lease_capability(driver)}
+
+
 @app.put("/v1/cores/{core_id}/accounts")
 async def core_accounts(core_id: str, body: AccountsPayload,
                         _node=Depends(signed_request)):
@@ -496,10 +662,21 @@ async def core_accounts(core_id: str, body: AccountsPayload,
     if core_id not in core_manager.list_cores():
         raise HTTPException(404, f"core '{core_id}' is not installed")
     driver = core_manager.get(core_id)
-    accounts = [_to_user_account(raw) for raw in body.accounts]
+    base_raws = [raw for raw in body.accounts if isinstance(raw, dict)]
+    if body.replace:
+        desired_base = base_raws
+    else:
+        merged = {str(raw.get("account_id") or ""): raw
+                  for raw in accounts_store.load(core_id)
+                  if raw.get("account_id")}
+        merged.update({str(raw.get("account_id") or ""): raw
+                       for raw in base_raws if raw.get("account_id")})
+        desired_base = list(merged.values())
+    accounts = _combined_accounts(core_id, desired_base)
     try:
-        await asyncio.wait_for(
-            driver.sync_accounts(accounts), timeout=_ACCOUNTS_TIMEOUT)
+        async with _account_locks.setdefault(core_id, asyncio.Lock()):
+            await asyncio.wait_for(
+                driver.sync_accounts(accounts), timeout=_ACCOUNTS_TIMEOUT)
     except asyncio.TimeoutError as exc:
         raise HTTPException(504, "account sync timed out") from exc
     except NotImplementedError as exc:
@@ -717,21 +894,25 @@ async def restore_accounts() -> None:
     speed limit turned into a no-op until the next full sync. Replaying the
     snapshot restores the same state without waiting for the panel.
     """
-    for core_id, raws in accounts_store.all().items():
-        if not raws or core_id not in core_manager.list_cores():
+    base = accounts_store.all()
+    lease_cores = {str(record.get("core_id"))
+                   for record in lease_store.active() if record.get("core_id")}
+    for core_id in sorted(set(base) | lease_cores):
+        raws = list(base.get(core_id) or [])
+        if core_id not in core_manager.list_cores():
             continue
-        accounts = []
-        for raw in raws:
-            try:
-                accounts.append(_to_user_account(raw))
-            except HTTPException as exc:
-                logger.warning("stored account for %s is stale: %s",
-                               core_id, exc.detail)
+        try:
+            accounts = _combined_accounts(core_id, raws)
+        except HTTPException as exc:
+            logger.warning("stored account for %s is stale: %s",
+                           core_id, exc.detail)
+            continue
         if not accounts:
             continue
         try:
-            await asyncio.wait_for(core_manager.get(core_id).sync_accounts(
-                accounts), timeout=_ACCOUNTS_TIMEOUT)
+            async with _account_locks.setdefault(core_id, asyncio.Lock()):
+                await asyncio.wait_for(core_manager.get(core_id).sync_accounts(
+                    accounts), timeout=_ACCOUNTS_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 — never block the boot
             logger.warning("account restore failed for %s: %s", core_id, exc)
         else:
@@ -907,8 +1088,17 @@ async def core_inbounds(core_id: str, body: InboundDocument,
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     try:
-        await asyncio.wait_for(
-            core_manager.apply_studio_document(core_id, document), timeout=120)
+        async with _account_locks.setdefault(core_id, asyncio.Lock()):
+            await asyncio.wait_for(
+                core_manager.apply_studio_document(core_id, document), timeout=120)
+            # Applying a listener document can rebuild a core's native config.
+            # Re-assert live leases from the separate encrypted store so normal
+            # panel convergence never erases temporary device identities.
+            driver = core_manager.get(core_id)
+            for raw in _active_lease_raws(core_id):
+                await asyncio.wait_for(
+                    driver.update_account(_to_user_account(raw)),
+                    timeout=_ACCOUNTS_TIMEOUT)
     except asyncio.TimeoutError as exc:
         raise HTTPException(504, "inbound apply timed out") from exc
     except Exception as exc:

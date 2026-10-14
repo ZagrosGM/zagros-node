@@ -504,6 +504,9 @@ hook_from_environment(%r, %r, sys.argv[1] if len(sys.argv) > 1 else "")
         await asyncio.to_thread(self._materialize)
         await asyncio.to_thread(self._backend.reload)
 
+    def account_teardown_capability(self) -> str:
+        return "targeted"
+
     async def create_account(self, account: UserAccount) -> None:
         self._ensure_password(account)
         self._ensure_bandwidth_address(account)
@@ -669,7 +672,7 @@ hook_from_environment(%r, %r, sys.argv[1] if len(sys.argv) > 1 else "")
     async def build_client_config(
         self, account: UserAccount, node: Any | None = None,
     ) -> ClientConfig:
-        host, listener = self._delivery_values(account)
+        host, listener = self._delivery_values(account, node)
         return ClientConfig(
             core_id="pptp", protocol="pptp", engine="pptp",
             payload={

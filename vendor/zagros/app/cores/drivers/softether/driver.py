@@ -1250,6 +1250,9 @@ class SoftEtherDriver(BaseCoreDriver):
         except CoreError:
             pass  # server momentarily unreachable; expiry/auth still blocks access
 
+    def account_teardown_capability(self) -> str:
+        return "targeted"
+
     async def create_account(self, account: UserAccount) -> None:
         self._ensure_supported(account.protocol)
         self._provision_credentials(account)
@@ -1578,7 +1581,9 @@ class SoftEtherDriver(BaseCoreDriver):
         self._ensure_supported(account.protocol)
         self._provision_credentials(account)
         s = self.settings
-        server = s.get("advertise_host")
+        from app.cores.delivery import resolve_delivery_host
+
+        server = resolve_delivery_host(s.get("advertise_host"), context)
         password = str(account.settings["password"])
         profile = DeliveryProfile(core_id=self.metadata.id)
 

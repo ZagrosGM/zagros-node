@@ -551,6 +551,9 @@ class SSHTunnelDriver(BaseCoreDriver):
         return str(account.settings.get("password")
                    or self.settings.get("default_password") or "")
 
+    def account_teardown_capability(self) -> str:
+        return "targeted"
+
     async def create_account(self, account: UserAccount) -> None:
         self._ensure_supported(account.protocol)
         self._provision_credentials(account)
