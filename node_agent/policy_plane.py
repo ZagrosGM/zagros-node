@@ -67,6 +67,71 @@ class PolicyPlane:
         return outbounds, rules
 
     # ------------------------------------------------------------------ #
+    #: cores that route INSIDE their own process (the host policy plane's
+    #: nft classifiers never see their traffic — same split as the master).
+    _NATIVE_ROUTING_CORES = ("xray", "sing-box")
+
+    def _apply_native(self, outbounds: list, rules: list) -> dict[str, Any]:
+        """Deploy routing into the node's in-process cores (f-routingfix-2).
+
+        Phase A only fed the host policy plane, so an xray/sing-box inbound
+        on this node ignored every rule — traffic kept following the default
+        outbound. The drivers own the native translation (xray
+        ``routing.rules`` / sing-box ``route.rules``) and the standalone
+        backends persist the managed artifacts, so re-syncs cannot wipe
+        them. Runs in a worker thread: drivers are sync, asyncio.run wraps
+        their async surface.
+        """
+        import asyncio
+
+        from app.cores.outbounds.manager import OutboundManager
+        from app.cores.routing.model import RouteContext
+        from app.cores.types import Capability
+
+        async def _run() -> dict[str, Any]:
+            applied: dict[str, list[str]] = {}
+            unsupported: dict[str, list[dict]] = {}
+            notes: dict[str, list[str]] = {}
+            targets = [core_id for core_id in self._core_manager.list_cores()
+                       if core_id in self._NATIVE_ROUTING_CORES]
+            if not targets:
+                return {"applied": {}, "unsupported": {}, "notes": {}}
+            manager = OutboundManager(self._core_manager)
+            ctx = RouteContext(
+                available_outbounds=[o.name for o in outbounds])
+            for core_id in targets:
+                try:
+                    driver = self._core_manager.get(core_id)
+                except Exception:  # noqa: BLE001 — per-core isolation
+                    continue
+                resolved: list = []
+                core_notes: list[str] = []
+                for ob in outbounds:
+                    if (ob.kind.value == "core"
+                            and ob.settings.get("core_id") == core_id):
+                        core_notes.append(
+                            f"outbound '{ob.name}' chains INTO this core; "
+                            "not materialized locally.")
+                        continue
+                    try:
+                        resolved.append(await manager.materialize(
+                            ob, requester_core_id=core_id))
+                    except Exception as exc:  # noqa: BLE001
+                        core_notes.append(
+                            f"outbound '{ob.name}': {exc}")
+                if driver.supports(Capability.OUTBOUND_MANAGEMENT) and resolved:
+                    await driver.deploy_outbounds(resolved)
+                native = await driver.deploy_routing_rules(rules, ctx)
+                applied[core_id] = list(native.applied)
+                unsupported[core_id] = [u.model_dump(mode="json")
+                                        for u in native.unsupported]
+                notes[core_id] = core_notes + list(native.notes)
+            return {"applied": applied, "unsupported": unsupported,
+                    "notes": notes}
+
+        return asyncio.run(_run())
+
+    # ------------------------------------------------------------------ #
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Apply the FULL desired state; empty state = symmetric teardown."""
         from app.cores.routing.policy import PolicyRuleReport
@@ -90,6 +155,24 @@ class PolicyPlane:
                                 for k, v in report.unsupported.items()},
                 "notes": {k: list(v) for k, v in report.notes.items()},
             }
+            # f-routingfix-2: xray/sing-box route in their own processes —
+            # feed them natively or their inbounds ignore every rule.
+            try:
+                native = self._apply_native(outbounds, rules)
+            except Exception as exc:  # noqa: BLE001 — honest per-plane report
+                summary["notes"].setdefault("_native", []).append(
+                    f"native routing deployment failed: {exc}")
+            else:
+                for section in ("applied", "unsupported", "notes"):
+                    for core_id, value in (native.get(section) or {}).items():
+                        target = summary[section].setdefault(core_id, [])
+                        if section == "unsupported":
+                            target.extend(value)
+                        elif section == "applied":
+                            summary[section][core_id] = list(
+                                dict.fromkeys(list(target) + list(value)))
+                        else:
+                            target.extend(value)
             self._persist(payload)
             return {"ok": True, "teardown": False, **summary}
 

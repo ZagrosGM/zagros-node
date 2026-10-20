@@ -58,13 +58,32 @@ class RuleScope(BaseModel):
     ``everywhere`` (default) reproduces today's behaviour exactly. ``master``
     pins a rule to the master's own policy plane. ``{"nodes": [ids]}`` targets
     specific node ids — such rules are EXCLUDED from the master's deploy and
-    reported as ``skipped_by_scope`` until node-side routing deployment
-    lands; the panel never pretends a node-only rule is live on the master.
+    reported as ``skipped_by_scope``; since f-noderouting-2 they ARE pushed
+    to exactly those nodes.
     """
     nodes: list[int] = Field(default_factory=list)
 
-    def applies_on_master(self) -> bool:
+    def targets_nodes_only(self) -> bool:
+        """True when the rule is pinned to specific node ids and must stay
+        OFF the master's own deploy (it travels via the node policy plane)."""
         return bool(self.nodes)
+
+    def applies_on_master(self) -> bool:
+        """Historical name kept for call sites/tests: True when this rule is
+        NOT node-pinned, i.e. it deploys on the master like any default rule.
+        Prefer the explicit :meth:`targets_nodes_only` at new call sites."""
+        return not self.targets_nodes_only()
+
+    def applies_on_node(self, node_id: int) -> bool:
+        """f-noderouting-2: default scopes reach EVERY node; a scoped rule
+        reaches only the nodes it lists."""
+        return not self.nodes or int(node_id) in {int(n) for n in self.nodes}
+
+
+def effective_rules_for_node(rules: list["RoutingRule"],
+                             node_id: int) -> list["RoutingRule"]:
+    """The rule set ONE node should enforce (f-noderouting-2, phase A)."""
+    return [r for r in rules if r.enabled and r.scope.applies_on_node(node_id)]
 
 
 class RoutingRule(BaseModel):
