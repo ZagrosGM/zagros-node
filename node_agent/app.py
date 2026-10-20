@@ -118,6 +118,12 @@ core_manager = CoreManager(
 # wire — see node_agent/limits.py.
 limiter = NodeBandwidthLimiter(core_manager, CFG.data_dir)
 accounts_store = AccountsStore(CFG.data_dir)
+# f-noderouting-2: the node's own policy-routing plane — the master pushes
+# the FULL desired rule/outbound state over the signed channel; see
+# node_agent/policy_plane.py.
+from node_agent.policy_plane import PolicyPlane
+
+policy_plane = PolicyPlane(core_manager, CFG.data_dir)
 lease_store = LeaseStore(CFG.data_dir)
 _account_locks: dict[str, asyncio.Lock] = {}
 
@@ -205,6 +211,11 @@ async def lifespan(_app: FastAPI):
         await restore_accounts()
         limiter.load()
         limiter.apply()   # limits pushed earlier must survive a restart
+        # f-noderouting-2: the routing state the master last wanted is
+        # re-applied — an agent restart is a non-event for policy routing.
+        policy_summary = await asyncio.to_thread(policy_plane.reconcile_on_boot)
+        if policy_summary.get("reconciled"):
+            logger.info("policy plane reconciled on boot")
         lease_task = asyncio.create_task(_lease_expiry_loop())
         try:
             yield
@@ -328,6 +339,12 @@ async def heartbeat(_node=Depends(signed_request)):
 
 @app.post("/v1/revoke")
 async def revoke(_node=Depends(signed_request)):
+    # f-noderouting-2: unpairing must leave no stale nft table / domain
+    # process behind — the plane is torn down symmetrically.
+    try:
+        await asyncio.to_thread(policy_plane.teardown)
+    except Exception:  # noqa: BLE001 — revoke must always succeed
+        pass
     identity.revoke()
     return {"revoked": True}
 
@@ -377,7 +394,8 @@ async def cores(_node=Depends(signed_request)):
         # Explicit protocol capabilities let a patched panel roll out before
         # patched nodes without sending reserved material references to an old
         # agent that would persist them as ordinary (and unusable) paths.
-        "features": {"xray_tls_material": 1, "connection_leases": 1},
+        "features": {"xray_tls_material": 1, "connection_leases": 1,
+                     "policy_routing": 1},
         # catalog = every allowlisted core this image can install, minus the
         # ones already installed (exactly the panel's Master semantics).
         "available": sorted(NODE_CORE_ALLOWLIST.intersection(
@@ -694,6 +712,31 @@ async def core_accounts(core_id: str, body: AccountsPayload,
                                      "replace": body.replace})
     return {"ok": True, "core_id": core_id, "count": len(accounts),
             "replace": body.replace}
+
+
+class PolicyPayload(BaseModel):
+    """f-noderouting-2: the master's FULL desired policy state.
+
+    Both lists are complete replacements (apply == reconcile): outbounds
+    first (interfaces/tables must exist before classifiers reference
+    them), then the rule set. Credentials ride the signed channel like
+    identity material and are never logged — audits record shapes only.
+    """
+    outbounds: list[dict] = Field(default_factory=list)
+    rules: list[dict] = Field(default_factory=list)
+
+
+@app.put("/v1/policy")
+async def apply_policy(body: PolicyPayload, _node=Depends(signed_request)):
+    try:
+        summary = await asyncio.to_thread(policy_plane.apply, body.model_dump())
+    except Exception as exc:  # noqa: BLE001 — name the failing piece honestly
+        identity.audit("policy.failed", {"error_type": type(exc).__name__})
+        raise HTTPException(422, f"policy apply failed: {exc}") from exc
+    identity.audit("policy.applied", {
+        "outbounds": len(body.outbounds), "rules": len(body.rules),
+        "teardown": bool(summary.get("teardown"))})
+    return summary
 
 
 class IPBansBody(BaseModel):
