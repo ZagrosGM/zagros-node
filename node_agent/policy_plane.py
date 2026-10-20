@@ -141,20 +141,26 @@ class PolicyPlane:
             if not rules and not outbounds:
                 summary = self.teardown()
                 return {"ok": True, "teardown": True, **summary}
-            manager = self._get()
-            # The master's own order: prove every outbound interface/table
-            # first, then atomically replace classifiers. prepare() starts
-            # the domain processes; failures name the outbound, never a
-            # bare 500.
-            manager.prepare(outbounds)
-            report: PolicyRuleReport = manager.apply_rules(rules)
-            summary = {
-                "applied": {k: list(v) for k, v in report.applied.items()},
-                "unsupported": {k: [u.model_dump(mode="json")
-                                    for u in v]
-                                for k, v in report.unsupported.items()},
-                "notes": {k: list(v) for k, v in report.notes.items()},
-            }
+            summary = {"applied": {}, "unsupported": {}, "notes": {}}
+            # The host policy plane (nft classifiers + kernel domains) serves
+            # the SERVICE cores. A node running only in-process cores
+            # (xray/sing-box) has no sing-box domain binary and no service
+            # cores — a prepare() failure there must NOT block the native
+            # application below, exactly like the master's engine treats the
+            # two planes as independent.
+            try:
+                manager = self._get()
+                manager.prepare(outbounds)
+                report: PolicyRuleReport = manager.apply_rules(rules)
+                summary["applied"] = {k: list(v) for k, v in report.applied.items()}
+                summary["unsupported"] = {k: [u.model_dump(mode="json")
+                                              for u in v]
+                                          for k, v in report.unsupported.items()}
+                summary["notes"] = {k: list(v) for k, v in report.notes.items()}
+            except Exception as exc:  # noqa: BLE001 — plane-isolated, honest
+                summary["notes"].setdefault("_host_plane", []).append(
+                    f"host policy plane unavailable ({exc}); in-process cores "
+                    "still receive routing natively")
             # f-routingfix-2: xray/sing-box route in their own processes —
             # feed them natively or their inbounds ignore every rule.
             try:
